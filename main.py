@@ -8,10 +8,77 @@ from nltk.tokenize import word_tokenize
 import os
 import pickle
 import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 nltk.download('punkt')  
 
 nlp = spacy.load('en_core_web_sm')
+
+class SimpleCRF(nn.Module):
+    def __init__(self, num_tags):
+        super(SimpleCRF, self).__init__()
+        self.num_tags = num_tags
+        self.transitions = nn.Parameter(torch.randn(num_tags, num_tags))
+        self.start_transitions = nn.Parameter(torch.randn(num_tags))
+        self.end_transitions = nn.Parameter(torch.randn(num_tags))
+
+    def forward(self, emissions, tags, mask=None):
+        if mask is None:
+            mask = torch.ones_like(tags, dtype=torch.uint8)
+
+        log_likelihood = self._compute_log_likelihood(emissions, tags, mask)
+        return -log_likelihood
+
+    def _compute_log_likelihood(self, emissions, tags, mask):
+        seq_length, batch_size, num_tags = emissions.size()
+        score = self.start_transitions[tags[0]] + emissions[0, torch.arange(batch_size), tags[0]]
+
+        for i in range(1, seq_length):
+            transition_score = self.transitions[tags[i - 1], tags[i]]
+            emission_score = emissions[i, torch.arange(batch_size), tags[i]]
+            score += (transition_score + emission_score) * mask[i]
+
+        last_tag_indices = mask.sum(dim=0) - 1
+        last_tags = tags.gather(0, last_tag_indices.unsqueeze(0)).squeeze(0)
+        score += self.end_transitions[last_tags]
+
+        return score.sum()
+
+    def _viterbi_decode(self, emissions, mask):
+        seq_length, batch_size, num_tags = emissions.size()
+        viterbi_score = self.start_transitions + emissions[0]
+        viterbi_path = torch.zeros_like(emissions, dtype=torch.long)
+
+        for i in range(1, seq_length):
+            broadcast_score = viterbi_score.unsqueeze(2)
+            broadcast_emission = emissions[i].unsqueeze(1)
+            score = broadcast_score + self.transitions + broadcast_emission
+            best_score, best_path = score.max(dim=1)
+            viterbi_score = best_score * mask[i].unsqueeze(1) + viterbi_score * (1 - mask[i].unsqueeze(1))
+            viterbi_path[i] = best_path
+
+        last_tag_indices = mask.sum(dim=0) - 1
+        best_tags = [viterbi_path[last_tag_indices[i], i].item() for i in range(batch_size)]
+
+        return best_tags
+
+    def fit(self, emissions, tags, mask=None, epochs=10, lr=0.01):
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+        for epoch in range(epochs):
+            self.train()
+            optimizer.zero_grad()
+            loss = self.forward(emissions, tags, mask)
+            loss.backward()
+            optimizer.step()
+            print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item()}")
+
+    def predict(self, emissions, mask=None):
+        self.eval()
+        with torch.no_grad():
+            return self._viterbi_decode(emissions, mask)
+
 
 def load_data(train_path, test_path, use_cache=True, cache_dir='cache'):
     """Load and parse the NER dataset using spaCy with caching support."""
